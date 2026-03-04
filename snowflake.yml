@@ -3,22 +3,5 @@ streamlit:
   name: CONTEXT_ENGINE_APP
   stage: CONTEXT_ENGINE.UPLOADS
   query_warehouse: SALESANALYTICS_ANALYTICAL_WH
-  main_file: app.py
+  main_file: streamlit_app.py
   title: "Snowflake Context Engine"
-  pages_dir: pages/
-  additional_source_files:
-    - lib/__init__.py
-    - lib/snowflake_connection.py
-    - lib/context_store.py
-    - lib/document_processor.py
-    - lib/context_extractor.py
-    - lib/interview_engine.py
-    - lib/answer_processor.py
-    - lib/yaml_generator.py
-    - lib/vqr_generator.py
-    - lib/instructions_generator.py
-    - prompts/summarize_answer.txt
-    - prompts/generate_followup.txt
-    - prompts/extract_context.txt
-    - prompts/generate_yaml.txt
-    - prompts/generate_vqr.txt
