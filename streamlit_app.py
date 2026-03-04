@@ -9,17 +9,34 @@ capture business rules, metrics, terminology, and data relationships.
 Outputs Semantic View YAML, Verified Query Repository, and Custom Instructions.
 """
 
+from __future__ import annotations
+
 import io
 import json
 import os
 import tempfile
 import uuid
 from datetime import date, datetime
+from typing import Dict, List, Optional
 
 import streamlit as st
 import yaml
 from snowflake.snowpark import Session
-from snowflake.snowpark.context import get_active_session
+
+try:
+    from snowflake.snowpark.context import get_active_session as _get_active_session
+except ImportError:
+    _get_active_session = None
+
+try:
+    from pptx import Presentation as _Presentation
+except ImportError:
+    _Presentation = None
+
+try:
+    from docx import Document as _Document
+except ImportError:
+    _Document = None
 
 
 # =============================================================================
@@ -30,7 +47,9 @@ def get_session() -> Session:
     """Get or create a Snowpark session."""
     if "snowpark_session" not in st.session_state:
         try:
-            session = get_active_session()
+            if _get_active_session is None:
+                raise RuntimeError("Not running in Snowflake")
+            session = _get_active_session()
         except Exception:
             session = Session.builder.configs({
                 "account": st.secrets["snowflake"]["account"],
@@ -516,9 +535,10 @@ def _extract_pdf(stage_path: str) -> str:
 
 def _extract_pptx(uploaded_file) -> str:
     """Extract text from a PowerPoint file."""
-    from pptx import Presentation
+    if _Presentation is None:
+        return "(python-pptx is not installed — PowerPoint extraction unavailable)"
 
-    prs = Presentation(io.BytesIO(uploaded_file.getvalue()))
+    prs = _Presentation(io.BytesIO(uploaded_file.getvalue()))
     texts = []
 
     for slide_num, slide in enumerate(prs.slides, 1):
@@ -549,9 +569,10 @@ def _extract_pptx(uploaded_file) -> str:
 
 def _extract_docx(uploaded_file) -> str:
     """Extract text from a Word document."""
-    from docx import Document
+    if _Document is None:
+        return "(python-docx is not installed — Word document extraction unavailable)"
 
-    doc = Document(io.BytesIO(uploaded_file.getvalue()))
+    doc = _Document(io.BytesIO(uploaded_file.getvalue()))
     texts = []
 
     for paragraph in doc.paragraphs:

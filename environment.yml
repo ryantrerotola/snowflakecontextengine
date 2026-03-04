@@ -2,7 +2,7 @@ name: context_engine
 channels:
   - snowflake
 dependencies:
-  - python=3.11
+  - python=3.10
   - streamlit
   - snowflake-snowpark-python
   - snowflake-ml-python
