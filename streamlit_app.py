@@ -38,6 +38,11 @@ try:
 except ImportError:
     _Document = None
 
+try:
+    from openai import OpenAI as _OpenAI
+except ImportError:
+    _OpenAI = None
+
 
 # =============================================================================
 # SNOWFLAKE CONNECTION
@@ -450,7 +455,20 @@ def process_file(uploaded_file, stage_path: str) -> dict:
 
     try:
         if file_type == "pdf":
-            text = _extract_pdf(stage_path)
+            try:
+                text = _extract_pdf(stage_path)
+            except Exception:
+                # Fallback: try reading PDF bytes with basic extraction
+                try:
+                    import PyPDF2
+                    reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.getvalue()))
+                    pages = [page.extract_text() or "" for page in reader.pages]
+                    text = "\n\n".join(pages)
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"PDF extraction failed. Cortex PARSE_DOCUMENT error and "
+                        f"PyPDF2 fallback also failed: {e2}"
+                    )
         elif file_type == "pptx":
             text = _extract_pptx(uploaded_file)
         elif file_type == "docx":
@@ -491,23 +509,73 @@ def process_file(uploaded_file, stage_path: str) -> dict:
 def stage_file(uploaded_file, session_id: str) -> str:
     """Upload a file to the Snowflake internal stage. Returns the stage path."""
     session = get_session()
-    stage_path = f"@CONTEXT_ENGINE.UPLOADS/{session_id}/{uploaded_file.name}"
+    safe_name = uploaded_file.name.replace("'", "").replace(" ", "_")
+    stage_path = f"@CONTEXT_ENGINE.UPLOADS/{session_id}/{safe_name}"
+    stage_dir = f"@CONTEXT_ENGINE.UPLOADS/{session_id}/"
+    file_bytes = uploaded_file.getvalue()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}") as tmp:
-        tmp.write(uploaded_file.getvalue())
-        tmp_path = tmp.name
-
+    # Try multiple approaches for SiS compatibility
+    # Approach 1: put_stream (works in newer Snowpark versions)
     try:
-        session.file.put(
-            tmp_path,
-            f"@CONTEXT_ENGINE.UPLOADS/{session_id}/",
+        stream = io.BytesIO(file_bytes)
+        session.file.put_stream(
+            stream,
+            stage_dir + safe_name,
             auto_compress=False,
             overwrite=True,
         )
-    finally:
-        os.unlink(tmp_path)
+        return stage_path
+    except (AttributeError, Exception):
+        pass
 
-    return stage_path
+    # Approach 2: tempfile + file.put (works in local dev)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=f"_{safe_name}"
+        ) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        session.file.put(
+            tmp_path,
+            stage_dir,
+            auto_compress=False,
+            overwrite=True,
+        )
+        return stage_path
+    except Exception:
+        pass
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    # Approach 3: write via /tmp directly (SiS fallback)
+    try:
+        tmp_dir = "/tmp"
+        os.makedirs(f"{tmp_dir}/{session_id}", exist_ok=True)
+        local_path = f"{tmp_dir}/{session_id}/{safe_name}"
+        with open(local_path, "wb") as f:
+            f.write(file_bytes)
+        session.file.put(
+            local_path,
+            stage_dir,
+            auto_compress=False,
+            overwrite=True,
+        )
+        return stage_path
+    except Exception:
+        pass
+    finally:
+        try:
+            if local_path and os.path.exists(local_path):
+                os.unlink(local_path)
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        f"Could not stage file '{uploaded_file.name}'. "
+        "Ensure the stage @CONTEXT_ENGINE.UPLOADS exists and is accessible."
+    )
 
 
 def _extract_pdf(stage_path: str) -> str:
@@ -598,6 +666,71 @@ def _get_file_type(filename: str) -> str:
     """Get normalized file type from filename."""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     return ext
+
+
+# =============================================================================
+# VOICE TRANSCRIPTION (OpenAI Whisper)
+# =============================================================================
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    """Transcribe audio bytes using OpenAI Whisper API.
+
+    Requires OPENAI_API_KEY in st.secrets or environment variables.
+    """
+    if _OpenAI is None:
+        raise RuntimeError(
+            "The openai package is not installed. "
+            "Add 'openai' to requirements.txt and reinstall."
+        )
+
+    api_key = None
+    try:
+        api_key = st.secrets["openai"]["api_key"]
+    except Exception:
+        api_key = os.environ.get("OPENAI_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "OpenAI API key not found. Set it in st.secrets['openai']['api_key'] "
+            "or the OPENAI_API_KEY environment variable."
+        )
+
+    client = _OpenAI(api_key=api_key)
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = "recording.wav"
+
+    transcript = client.audio.transcriptions.create(
+        model="whisper-1",
+        file=audio_file,
+        response_format="text",
+    )
+    return transcript.strip()
+
+
+def summarize_transcript(transcript: str) -> str:
+    """Use Cortex COMPLETE to clean up and summarize a voice transcript."""
+    if not transcript or len(transcript.strip()) < 10:
+        return transcript
+
+    prompt = f"""The following is a voice transcript from an interview about a Snowflake data environment.
+Clean it up by:
+- Fixing any obvious transcription errors
+- Removing filler words (um, uh, like, you know)
+- Preserving all technical details, table names, column names, and business logic exactly as stated
+- Keeping the same meaning and intent
+
+Do NOT add information that wasn't in the original. Return only the cleaned-up text.
+
+TRANSCRIPT:
+{transcript}
+
+CLEANED TEXT:"""
+
+    try:
+        cleaned = call_cortex_complete(prompt)
+        return cleaned.strip()
+    except Exception:
+        return transcript
 
 
 # =============================================================================
@@ -1772,6 +1905,288 @@ def generate_markdown_doc(session_id: str) -> str:
 
 
 # =============================================================================
+# RAG / CORTEX SEARCH EXPORT
+# =============================================================================
+
+def generate_rag_chunks(session_id: str) -> list[dict]:
+    """Generate chunked context documents optimized for RAG / Cortex Search.
+
+    Each chunk is a self-contained JSON object with:
+    - chunk_id: unique identifier
+    - content: the text content for embedding/search
+    - category: fact category for filtering
+    - entity_database, entity_schema, entity_table, entity_column: metadata
+    - source_type: INTERVIEW or DOCUMENT
+    - tags: list of searchable tags
+    - session_id: originating session
+    """
+    facts = get_all_facts(session_id)
+    if not facts:
+        return []
+
+    try:
+        schema_cache = get_cached_schema(session_id)
+    except Exception:
+        schema_cache = []
+
+    try:
+        responses = get_responses(session_id)
+    except Exception:
+        responses = []
+
+    try:
+        documents = get_documents(session_id)
+    except Exception:
+        documents = []
+
+    chunks = []
+
+    # --- Chunk Type 1: Individual facts (fine-grained, best for precise retrieval) ---
+    for fact in facts:
+        tags = [fact.get("CATEGORY", "")]
+        if fact.get("ENTITY_TABLE"):
+            tags.append(fact["ENTITY_TABLE"].lower())
+        if fact.get("ENTITY_COLUMN"):
+            tags.append(fact["ENTITY_COLUMN"].lower())
+        if fact.get("ENTITY_DATABASE"):
+            tags.append(fact["ENTITY_DATABASE"].lower())
+
+        chunks.append({
+            "chunk_id": f"fact_{fact['FACT_ID']}",
+            "chunk_type": "fact",
+            "content": fact["FACT_TEXT"],
+            "category": fact.get("CATEGORY", "general"),
+            "entity_database": fact.get("ENTITY_DATABASE"),
+            "entity_schema": fact.get("ENTITY_SCHEMA"),
+            "entity_table": fact.get("ENTITY_TABLE"),
+            "entity_column": fact.get("ENTITY_COLUMN"),
+            "source_type": fact.get("SOURCE_TYPE", "UNKNOWN"),
+            "confidence": fact.get("CONFIDENCE", 0.8),
+            "is_verified": bool(fact.get("IS_VERIFIED", False)),
+            "tags": tags,
+            "session_id": session_id,
+        })
+
+    # --- Chunk Type 2: Grouped facts by table (coarser, good for table-level context) ---
+    facts_by_table = {}
+    for fact in facts:
+        table = fact.get("ENTITY_TABLE")
+        if table:
+            if table not in facts_by_table:
+                facts_by_table[table] = []
+            facts_by_table[table].append(fact)
+
+    for table_name, table_facts in facts_by_table.items():
+        categories_present = list(set(f.get("CATEGORY", "") for f in table_facts))
+        content_parts = [f"Context for table: {table_name}\n"]
+        for cat in sorted(categories_present):
+            cat_facts = [f for f in table_facts if f.get("CATEGORY") == cat]
+            cat_label = cat.replace("_", " ").title()
+            content_parts.append(f"\n{cat_label}:")
+            for f in cat_facts:
+                content_parts.append(f"- {f['FACT_TEXT']}")
+
+        db = next((f.get("ENTITY_DATABASE") for f in table_facts if f.get("ENTITY_DATABASE")), None)
+        schema = next((f.get("ENTITY_SCHEMA") for f in table_facts if f.get("ENTITY_SCHEMA")), None)
+
+        chunks.append({
+            "chunk_id": f"table_{table_name.lower()}_{session_id[:8]}",
+            "chunk_type": "table_context",
+            "content": "\n".join(content_parts),
+            "category": "table_context",
+            "entity_database": db,
+            "entity_schema": schema,
+            "entity_table": table_name,
+            "entity_column": None,
+            "source_type": "AGGREGATED",
+            "confidence": 1.0,
+            "is_verified": False,
+            "tags": [table_name.lower()] + categories_present,
+            "session_id": session_id,
+        })
+
+    # --- Chunk Type 3: Interview Q&A pairs (rich conversational context) ---
+    for resp in responses:
+        content = f"Q: {resp['QUESTION_TEXT']}\nA: {resp['RAW_ANSWER']}"
+        if resp.get("SUMMARIZED_ANSWER"):
+            content += f"\n\nSummary: {resp['SUMMARIZED_ANSWER']}"
+
+        chunks.append({
+            "chunk_id": f"interview_{resp['RESPONSE_ID']}",
+            "chunk_type": "interview_qa",
+            "content": content,
+            "category": resp.get("TOPIC_AREA", "general"),
+            "entity_database": None,
+            "entity_schema": None,
+            "entity_table": None,
+            "entity_column": None,
+            "source_type": "INTERVIEW",
+            "confidence": 1.0,
+            "is_verified": False,
+            "tags": [resp.get("TOPIC_AREA", "general"), "interview"],
+            "session_id": session_id,
+        })
+
+    # --- Chunk Type 4: Document summaries (broad context from uploads) ---
+    for doc in documents:
+        if doc.get("PROCESSING_STATUS") != "COMPLETED":
+            continue
+
+        if doc.get("SUMMARY"):
+            chunks.append({
+                "chunk_id": f"doc_summary_{doc['DOCUMENT_ID']}",
+                "chunk_type": "document_summary",
+                "content": f"Document: {doc['FILENAME']}\n\n{doc['SUMMARY']}",
+                "category": "document",
+                "entity_database": None,
+                "entity_schema": None,
+                "entity_table": None,
+                "entity_column": None,
+                "source_type": "DOCUMENT",
+                "confidence": 1.0,
+                "is_verified": False,
+                "tags": ["document", doc.get("FILE_TYPE", ""), doc["FILENAME"].lower()],
+                "session_id": session_id,
+            })
+
+        # For longer docs, chunk the extracted text into ~1000 char segments
+        extracted = doc.get("EXTRACTED_TEXT", "")
+        if extracted and len(extracted) > 500:
+            text_chunks = _chunk_text(extracted, chunk_size=1000, overlap=150)
+            for idx, text_chunk in enumerate(text_chunks):
+                chunks.append({
+                    "chunk_id": f"doc_chunk_{doc['DOCUMENT_ID']}_{idx}",
+                    "chunk_type": "document_chunk",
+                    "content": f"Source: {doc['FILENAME']} (chunk {idx + 1}/{len(text_chunks)})\n\n{text_chunk}",
+                    "category": "document",
+                    "entity_database": None,
+                    "entity_schema": None,
+                    "entity_table": None,
+                    "entity_column": None,
+                    "source_type": "DOCUMENT",
+                    "confidence": 0.9,
+                    "is_verified": False,
+                    "tags": ["document", doc.get("FILE_TYPE", ""), doc["FILENAME"].lower()],
+                    "session_id": session_id,
+                })
+
+    # --- Chunk Type 5: Schema descriptions (structural context) ---
+    if schema_cache:
+        tables_schema = {}
+        for col in schema_cache:
+            key = f"{col['DATABASE_NAME']}.{col['SCHEMA_NAME']}.{col['TABLE_NAME']}"
+            if key not in tables_schema:
+                tables_schema[key] = []
+            tables_schema[key].append(col)
+
+        for table_fqn, columns in tables_schema.items():
+            col_descriptions = []
+            for col in columns:
+                desc = f"  - {col['COLUMN_NAME']} ({col.get('DATA_TYPE', 'VARCHAR')})"
+                if col.get("COMMENT"):
+                    desc += f": {col['COMMENT']}"
+                col_descriptions.append(desc)
+
+            parts = table_fqn.split(".")
+            db = parts[0] if len(parts) > 0 else None
+            schema = parts[1] if len(parts) > 1 else None
+            table = parts[2] if len(parts) > 2 else parts[-1]
+
+            content = f"Table: {table_fqn}\nColumns:\n" + "\n".join(col_descriptions)
+
+            chunks.append({
+                "chunk_id": f"schema_{table_fqn.lower().replace('.', '_')}",
+                "chunk_type": "schema",
+                "content": content,
+                "category": "table_description",
+                "entity_database": db,
+                "entity_schema": schema,
+                "entity_table": table,
+                "entity_column": None,
+                "source_type": "SCHEMA_INTROSPECTION",
+                "confidence": 1.0,
+                "is_verified": True,
+                "tags": [table.lower(), "schema", "columns"],
+                "session_id": session_id,
+            })
+
+    return chunks
+
+
+def _chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> list[str]:
+    """Split text into overlapping chunks for RAG indexing."""
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+
+        # Try to break at a sentence or paragraph boundary
+        if end < len(text):
+            for sep in ["\n\n", "\n", ". ", "! ", "? "]:
+                break_point = text.rfind(sep, start + chunk_size // 2, end + 100)
+                if break_point > start:
+                    end = break_point + len(sep)
+                    break
+
+        chunks.append(text[start:end].strip())
+        start = end - overlap
+
+    return [c for c in chunks if c]
+
+
+def generate_rag_jsonl(session_id: str) -> str:
+    """Generate JSONL (one JSON object per line) for bulk loading into Cortex Search."""
+    chunks = generate_rag_chunks(session_id)
+    lines = [json.dumps(chunk, default=str) for chunk in chunks]
+    return "\n".join(lines)
+
+
+def generate_cortex_search_sql(session_id: str, table_name: str = "CONTEXT_ENGINE.RAG_CHUNKS") -> str:
+    """Generate SQL to create and populate a Cortex Search-ready table."""
+    sql_parts = [
+        f"-- Cortex Search table for RAG context",
+        f"-- Generated from session {session_id}",
+        f"",
+        f"CREATE TABLE IF NOT EXISTS {table_name} (",
+        f"    CHUNK_ID VARCHAR(255) PRIMARY KEY,",
+        f"    CHUNK_TYPE VARCHAR(50),",
+        f"    CONTENT VARCHAR(16777216),",
+        f"    CATEGORY VARCHAR(100),",
+        f"    ENTITY_DATABASE VARCHAR(255),",
+        f"    ENTITY_SCHEMA VARCHAR(255),",
+        f"    ENTITY_TABLE VARCHAR(255),",
+        f"    ENTITY_COLUMN VARCHAR(255),",
+        f"    SOURCE_TYPE VARCHAR(50),",
+        f"    CONFIDENCE FLOAT,",
+        f"    IS_VERIFIED BOOLEAN,",
+        f"    TAGS ARRAY,",
+        f"    SESSION_ID VARCHAR(255),",
+        f"    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()",
+        f");",
+        f"",
+        f"-- Create Cortex Search service on this table:",
+        f"-- CREATE OR REPLACE CORTEX SEARCH SERVICE {table_name}_SEARCH",
+        f"--   ON {table_name}",
+        f"--   WAREHOUSE = YOUR_WAREHOUSE",
+        f"--   TARGET_LAG = '1 hour'",
+        f"--   AS (",
+        f"--     SELECT",
+        f"--       CHUNK_ID,",
+        f"--       CONTENT,",
+        f"--       CATEGORY,",
+        f"--       ENTITY_TABLE,",
+        f"--       CHUNK_TYPE,",
+        f"--       TAGS",
+        f"--     FROM {table_name}",
+        f"--   );",
+    ]
+    return "\n".join(sql_parts)
+
+
+# =============================================================================
 # STREAMLIT UI — Single-Page App with Sidebar Navigation
 # =============================================================================
 
@@ -1984,13 +2399,17 @@ elif page == "📄 Upload Documents":
                 )
 
                 with st.status(f"Processing: {uploaded_file.name}", expanded=True) as status:
+                    # Reset file buffer position before each operation
+                    uploaded_file.seek(0)
+
                     st.write("Staging file to Snowflake...")
+                    staged_path = None
                     try:
                         staged_path = stage_file(uploaded_file, session_id)
                     except Exception as e:
-                        st.error(f"Failed to stage file: {e}")
-                        status.update(label=f"Failed: {uploaded_file.name}", state="error")
-                        continue
+                        st.warning(f"Could not stage file to Snowflake: {e}")
+                        st.write("Proceeding with in-memory processing...")
+                        staged_path = f"@CONTEXT_ENGINE.UPLOADS/{session_id}/{uploaded_file.name}"
 
                     doc_id = save_document(
                         session_id=session_id,
@@ -2001,6 +2420,7 @@ elif page == "📄 Upload Documents":
                     )
 
                     st.write("Extracting text content...")
+                    uploaded_file.seek(0)
                     result = process_file(uploaded_file, staged_path)
 
                     update_document(
@@ -2239,8 +2659,62 @@ elif page == "💬 Context Interview":
                             cat = fact.get("category", "").replace("_", " ").title()
                             st.markdown(f"- **[{cat}]** {fact.get('fact', '')}")
 
-    # Chat Input
-    if user_input := st.chat_input("Type your answer here..."):
+    # Input Mode Selection
+    if "input_mode" not in st.session_state:
+        st.session_state.input_mode = "text"
+
+    input_col1, input_col2 = st.columns([0.85, 0.15])
+    with input_col2:
+        input_mode = st.radio(
+            "Input",
+            ["Text", "Voice"],
+            horizontal=True,
+            key="input_mode_radio",
+            label_visibility="collapsed",
+        )
+
+    user_input = None
+
+    if input_mode == "Voice":
+        with input_col1:
+            st.markdown("**Record your answer** (uses OpenAI Whisper for transcription)")
+        audio_data = st.audio_input(
+            "Record your answer",
+            key="voice_recording",
+            label_visibility="collapsed",
+        )
+        if audio_data is not None:
+            audio_bytes = audio_data.getvalue()
+            if audio_bytes and len(audio_bytes) > 0:
+                with st.spinner("Transcribing audio with OpenAI Whisper..."):
+                    try:
+                        raw_transcript = transcribe_audio(audio_bytes)
+                        if raw_transcript:
+                            st.markdown("**Raw transcript:**")
+                            st.info(raw_transcript)
+                            cleaned = summarize_transcript(raw_transcript)
+                            if cleaned != raw_transcript:
+                                st.markdown("**Cleaned transcript:**")
+                                st.success(cleaned)
+                            user_input = cleaned
+                        else:
+                            st.warning("No speech detected in the recording. Try again.")
+                    except Exception as e:
+                        st.error(f"Transcription failed: {e}")
+                        st.info(
+                            "Make sure your OpenAI API key is configured in "
+                            "st.secrets['openai']['api_key'] or OPENAI_API_KEY env var."
+                        )
+
+                if user_input:
+                    if st.button("Submit Voice Answer", type="primary"):
+                        pass  # Will be processed below
+                    else:
+                        user_input = None  # Wait for explicit submit
+    else:
+        user_input = st.chat_input("Type your answer here...")
+
+    if user_input:
         st.session_state.chat_messages.append({
             "role": "user",
             "content": user_input,
@@ -2442,11 +2916,12 @@ elif page == "🚀 Export & Deploy":
         st.warning("No context captured yet. Run an interview or upload documents first.")
         st.stop()
 
-    tab_yaml, tab_vqr, tab_instructions, tab_markdown = st.tabs([
+    tab_yaml, tab_vqr, tab_instructions, tab_markdown, tab_rag = st.tabs([
         "📐 Semantic View YAML",
         "✅ Verified Queries (VQR)",
         "📋 Custom Instructions",
         "📄 Markdown Doc",
+        "🔍 RAG / Cortex Search",
     ])
 
     # --- Semantic YAML ---
@@ -2628,6 +3103,181 @@ elif page == "🚀 Export & Deploy":
             latest = get_latest_artifact(session_id, "MARKDOWN_DOC")
             if latest:
                 st.markdown(latest["CONTENT"])
+
+    # --- RAG / Cortex Search ---
+    with tab_rag:
+        st.markdown("### RAG / Cortex Search Export")
+        st.markdown(
+            "Generate chunked context documents optimized for **Retrieval-Augmented Generation (RAG)** "
+            "and **Snowflake Cortex Search**. Each chunk includes metadata for filtering and "
+            "is sized for efficient vector embedding."
+        )
+
+        st.markdown("#### Chunk Types Generated")
+        st.markdown("""
+- **Individual Facts** — Fine-grained, one fact per chunk (best for precise retrieval)
+- **Table Context** — All facts grouped by table (good for table-level questions)
+- **Interview Q&A** — Full question-answer pairs from interviews (rich conversational context)
+- **Document Summaries** — Summaries of uploaded documents
+- **Document Chunks** — Uploaded document text split into ~1000 char overlapping segments
+- **Schema Descriptions** — Table/column metadata from schema introspection
+        """)
+
+        rag_col1, rag_col2 = st.columns(2)
+
+        with rag_col1:
+            if st.button("Generate RAG Chunks", type="primary", key="gen_rag"):
+                with st.spinner("Generating RAG chunks..."):
+                    chunks = generate_rag_chunks(session_id)
+                    jsonl_content = "\n".join(json.dumps(c, default=str) for c in chunks)
+
+                st.session_state.generated_rag_chunks = chunks
+                st.session_state.generated_rag_jsonl = jsonl_content
+                save_artifact(session_id, "RAG_JSONL", "rag_chunks.jsonl", jsonl_content)
+                st.success(f"Generated **{len(chunks)}** chunks!")
+
+        with rag_col2:
+            if st.button("Generate Cortex Search SQL", key="gen_cs_sql"):
+                rag_table = st.session_state.get("rag_table_name", "CONTEXT_ENGINE.RAG_CHUNKS")
+                sql = generate_cortex_search_sql(session_id, rag_table)
+                st.session_state.generated_cs_sql = sql
+
+        if "generated_rag_chunks" in st.session_state:
+            chunks = st.session_state.generated_rag_chunks
+
+            # Summary stats
+            chunk_types = {}
+            for c in chunks:
+                ct = c.get("chunk_type", "unknown")
+                chunk_types[ct] = chunk_types.get(ct, 0) + 1
+
+            st.markdown("#### Chunk Summary")
+            summary_cols = st.columns(len(chunk_types))
+            for i, (ct, count) in enumerate(sorted(chunk_types.items())):
+                with summary_cols[i]:
+                    st.metric(ct.replace("_", " ").title(), count)
+
+            # Preview
+            st.markdown("#### Preview (first 10 chunks)")
+            for chunk in chunks[:10]:
+                with st.expander(
+                    f"[{chunk['chunk_type']}] {chunk['content'][:80]}..."
+                ):
+                    st.json(chunk)
+
+            # Downloads
+            st.markdown("#### Download")
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                st.download_button(
+                    "Download JSONL (for Cortex Search / RAG)",
+                    data=st.session_state.generated_rag_jsonl,
+                    file_name="rag_chunks.jsonl",
+                    mime="application/jsonl",
+                )
+            with dl_col2:
+                st.download_button(
+                    "Download JSON Array",
+                    data=json.dumps(chunks, indent=2, default=str),
+                    file_name="rag_chunks.json",
+                    mime="application/json",
+                )
+
+            # Load to Snowflake table
+            st.markdown("---")
+            st.markdown("#### Load to Snowflake Table")
+            rag_table_name = st.text_input(
+                "Target Table",
+                value="CONTEXT_ENGINE.RAG_CHUNKS",
+                key="rag_table_name",
+            )
+
+            if st.button("Create Table & Load Chunks", key="load_rag"):
+                with st.spinner("Creating table and loading chunks..."):
+                    try:
+                        sql_ddl = generate_cortex_search_sql(session_id, rag_table_name)
+                        # Execute the CREATE TABLE statement
+                        create_stmt = sql_ddl.split(";")[0] + ";"
+                        # Remove comment lines
+                        create_stmt = "\n".join(
+                            line for line in create_stmt.split("\n")
+                            if not line.strip().startswith("--")
+                        )
+                        run_ddl(create_stmt)
+
+                        # Truncate existing data for this session
+                        try:
+                            run_ddl(
+                                f"DELETE FROM {rag_table_name} "
+                                f"WHERE SESSION_ID = '{_esc(session_id)}'"
+                            )
+                        except Exception:
+                            pass
+
+                        # Insert chunks
+                        loaded = 0
+                        for chunk in chunks:
+                            try:
+                                tags_sql = "ARRAY_CONSTRUCT(" + ", ".join(
+                                    f"'{_esc(t)}'" for t in chunk.get("tags", [])
+                                ) + ")"
+                                run_ddl(f"""
+                                    INSERT INTO {rag_table_name}
+                                    (CHUNK_ID, CHUNK_TYPE, CONTENT, CATEGORY,
+                                     ENTITY_DATABASE, ENTITY_SCHEMA, ENTITY_TABLE,
+                                     ENTITY_COLUMN, SOURCE_TYPE, CONFIDENCE,
+                                     IS_VERIFIED, TAGS, SESSION_ID)
+                                    VALUES (
+                                        '{_esc(chunk["chunk_id"])}',
+                                        '{_esc(chunk.get("chunk_type", ""))}',
+                                        '{_esc(chunk.get("content", ""))}',
+                                        '{_esc(chunk.get("category", ""))}',
+                                        {_sql_str(chunk.get("entity_database"))},
+                                        {_sql_str(chunk.get("entity_schema"))},
+                                        {_sql_str(chunk.get("entity_table"))},
+                                        {_sql_str(chunk.get("entity_column"))},
+                                        '{_esc(chunk.get("source_type", ""))}',
+                                        {chunk.get("confidence", 0.8)},
+                                        {chunk.get("is_verified", False)},
+                                        {tags_sql},
+                                        '{_esc(session_id)}'
+                                    )
+                                """)
+                                loaded += 1
+                            except Exception as e:
+                                st.warning(f"Failed to insert chunk {chunk['chunk_id']}: {e}")
+                                continue
+
+                        st.success(
+                            f"Loaded **{loaded}/{len(chunks)}** chunks into `{rag_table_name}`"
+                        )
+                        st.info(
+                            "To create a Cortex Search service, run:\n\n"
+                            f"```sql\n"
+                            f"CREATE OR REPLACE CORTEX SEARCH SERVICE {rag_table_name}_SEARCH\n"
+                            f"  ON {rag_table_name}\n"
+                            f"  WAREHOUSE = YOUR_WAREHOUSE\n"
+                            f"  TARGET_LAG = '1 hour'\n"
+                            f"  AS (\n"
+                            f"    SELECT CHUNK_ID, CONTENT, CATEGORY, ENTITY_TABLE,\n"
+                            f"           CHUNK_TYPE, TAGS\n"
+                            f"    FROM {rag_table_name}\n"
+                            f"  );\n"
+                            f"```"
+                        )
+                    except Exception as e:
+                        st.error(f"Failed to load chunks: {e}")
+
+        if st.session_state.get("generated_cs_sql"):
+            st.markdown("#### Cortex Search Setup SQL")
+            st.code(st.session_state.generated_cs_sql, language="sql")
+            st.download_button(
+                "Download SQL",
+                data=st.session_state.generated_cs_sql,
+                file_name="cortex_search_setup.sql",
+                mime="text/sql",
+                key="dl_cs_sql",
+            )
 
     # Version History
     st.markdown("---")
