@@ -1,0 +1,13 @@
+name: context_engine
+channels:
+  - snowflake
+dependencies:
+  - python=3.11
+  - streamlit
+  - snowflake-snowpark-python
+  - snowflake-ml-python
+  - pyyaml
+  - pip:
+      - python-pptx
+      - python-docx
+      - PyPDF2

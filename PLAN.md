@@ -380,12 +380,9 @@ snowflakecontextengine/
 
 ---
 
-## Key Design Decisions to Discuss
+## Design Decisions (Resolved)
 
-1. **Streamlit in Snowflake vs. External Streamlit?** - SiS has native Snowflake auth and stage access but some library restrictions. External Streamlit is more flexible but needs connection management.
-
-2. **LLM for interview questions** - Use `CORTEX.COMPLETE('llama3.1-70b', ...)` or `CORTEX.COMPLETE('mistral-large2', ...)`? The model choice affects question quality and cost.
-
-3. **Context storage granularity** - Store as individual facts (more structured, easier to search) or as narrative blocks (more natural, preserves nuance)?
-
-4. **Schema introspection** - Should the app auto-discover your Snowflake schema and pre-fill known tables/columns, or start completely blank and learn only from the user?
+1. **Deployment**: Streamlit in Snowflake (SiS) - native auth, direct stage access, no connection config needed.
+2. **LLM Model**: `CORTEX.COMPLETE('mistral-large2', ...)` for all interview question generation, answer processing, and context extraction.
+3. **Context Storage**: Individual facts - each piece of context stored as a tagged, searchable row. Easier to deduplicate, edit, and generate YAML from.
+4. **Schema Introspection**: Auto-discover via `INFORMATION_SCHEMA` on connect. Pre-populate databases, schemas, tables, columns, and data types. Interview builds on top of discovered schema.

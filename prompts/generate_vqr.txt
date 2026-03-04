@@ -1,0 +1,23 @@
+Generate verified query entries for a Snowflake Cortex Analyst Verified Query Repository.
+
+Based on the following metric definitions and common questions, generate natural language
+questions and corresponding Snowflake SQL queries.
+
+Metrics:
+{metrics}
+
+Common questions:
+{common_questions}
+
+Schema:
+{schema}
+
+Business rules to follow:
+{business_rules}
+
+For each query, provide:
+- "name": a short snake_case identifier
+- "question": the natural language question a user might ask
+- "sql": valid Snowflake SQL that correctly answers the question, following all business rules
+
+Return a JSON array of query objects. Return ONLY valid JSON, no other text.
