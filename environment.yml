@@ -5,3 +5,7 @@ dependencies:
   - streamlit
   - snowflake-snowpark-python
   - pyyaml
+  - python-pptx
+  - python-docx
+  - pip:
+    - openai>=1.0.0
