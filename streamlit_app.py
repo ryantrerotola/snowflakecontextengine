@@ -699,14 +699,12 @@ def _get_file_type(filename: str) -> str:
 
 def _get_openai_api_key() -> str:
     """Retrieve the OpenAI API key from a Snowflake secret, st.secrets, or env."""
-    # 1. Try Snowflake secret via SYSTEM$GET_SECRET
+    # 1. Try _snowflake module (Streamlit-in-Snowflake secret access)
     try:
-        session = get_session()
-        result = session.sql(
-            "SELECT SYSTEM$GET_SECRET('VSSANALYTICS_DB.DATA_GOVERNANCE.OPENAI_API_KEY', 'secret_string') AS KEY"
-        ).collect()
-        if result and result[0]["KEY"]:
-            return result[0]["KEY"]
+        import _snowflake
+        key = _snowflake.get_generic_secret_string("OPENAI_API_KEY")
+        if key:
+            return key
     except Exception:
         pass
 
@@ -723,7 +721,7 @@ def _get_openai_api_key() -> str:
 
     raise RuntimeError(
         "OpenAI API key not found. Checked: "
-        "VSSANALYTICS_DB.DATA_GOVERNANCE.OPENAI_API_KEY secret, "
+        "_snowflake.get_generic_secret_string('OPENAI_API_KEY'), "
         "st.secrets['openai']['api_key'], and OPENAI_API_KEY env var."
     )
 
