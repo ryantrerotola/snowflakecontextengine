@@ -2290,9 +2290,16 @@ st.sidebar.markdown("Build context for Snowflake Intelligence agents.")
 # Page Navigation (render FIRST so it always appears)
 # ---------------------------------------------------------------------------
 st.sidebar.markdown("---")
+_NAV_PAGES = ["🏠 Home", "📄 Upload Documents", "💬 Context Interview", "📝 Review & Edit", "🚀 Export & Deploy"]
+
+# Allow programmatic navigation: set st.session_state._nav_page before rerun
+if "_nav_page" not in st.session_state:
+    st.session_state._nav_page = _NAV_PAGES[0]
+
 page = st.sidebar.radio(
     "Navigate",
-    ["🏠 Home", "📄 Upload Documents", "💬 Context Interview", "📝 Review & Edit", "🚀 Export & Deploy"],
+    _NAV_PAGES,
+    key="_nav_page",
 )
 
 # ---------------------------------------------------------------------------
@@ -2420,6 +2427,7 @@ if page == "🏠 Home":
                     if st.button("Continue →", key=f"home_open_{sid}", type="primary",
                                  use_container_width=True):
                         st.session_state.interview_session_id = sid
+                        st.session_state._nav_page = "💬 Context Interview"
                         st.rerun()
 
     if "interview_session_id" in st.session_state:
