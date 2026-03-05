@@ -2287,6 +2287,15 @@ st.sidebar.title("❄️ Context Engine")
 st.sidebar.markdown("Build context for Snowflake Intelligence agents.")
 
 # ---------------------------------------------------------------------------
+# Page Navigation (render FIRST so it always appears)
+# ---------------------------------------------------------------------------
+st.sidebar.markdown("---")
+page = st.sidebar.radio(
+    "Navigate",
+    ["🏠 Home", "📄 Upload Documents", "💬 Context Interview", "📝 Review & Edit", "🚀 Export & Deploy"],
+)
+
+# ---------------------------------------------------------------------------
 # Session Selection / Creation (always in sidebar)
 # ---------------------------------------------------------------------------
 st.sidebar.markdown("---")
@@ -2295,8 +2304,8 @@ st.sidebar.header("Session")
 sessions = []
 try:
     sessions = list_sessions()
-except Exception:
-    st.sidebar.warning("Could not load sessions. Ensure database objects are created.")
+except Exception as e:
+    st.sidebar.warning(f"Could not load sessions: {e}")
 
 session_options = ["+ Create New Session"] + [
     f"{s['SESSION_NAME']} ({s['SESSION_ID'][:8]}...)" for s in sessions
@@ -2316,15 +2325,6 @@ if selected == "+ Create New Session":
 elif sessions:
     idx = session_options.index(selected) - 1
     st.session_state.interview_session_id = sessions[idx]["SESSION_ID"]
-
-# ---------------------------------------------------------------------------
-# Page Navigation
-# ---------------------------------------------------------------------------
-st.sidebar.markdown("---")
-page = st.sidebar.radio(
-    "Navigate",
-    ["🏠 Home", "📄 Upload Documents", "💬 Context Interview", "📝 Review & Edit", "🚀 Export & Deploy"],
-)
 
 
 # =============================================================================
