@@ -2659,60 +2659,81 @@ elif page == "💬 Context Interview":
                             cat = fact.get("category", "").replace("_", " ").title()
                             st.markdown(f"- **[{cat}]** {fact.get('fact', '')}")
 
-    # Input Mode Selection
-    if "input_mode" not in st.session_state:
-        st.session_state.input_mode = "text"
-
-    input_col1, input_col2 = st.columns([0.85, 0.15])
-    with input_col2:
-        input_mode = st.radio(
-            "Input",
-            ["Text", "Voice"],
-            horizontal=True,
-            key="input_mode_radio",
-            label_visibility="collapsed",
-        )
+    # Input Mode Selection (in sidebar to avoid layout conflicts)
+    st.sidebar.markdown("---")
+    input_mode = st.sidebar.radio(
+        "Input Mode",
+        ["Text", "Voice"],
+        horizontal=True,
+        key="input_mode_radio",
+    )
 
     user_input = None
 
+    # Voice recording section (above the chat input)
     if input_mode == "Voice":
-        with input_col1:
-            st.markdown("**Record your answer** (uses OpenAI Whisper for transcription)")
-        audio_data = st.audio_input(
-            "Record your answer",
-            key="voice_recording",
-            label_visibility="collapsed",
-        )
+        st.markdown("---")
+        st.markdown("**Record your answer** (uses OpenAI Whisper for transcription)")
+        _audio_input_available = hasattr(st, "audio_input")
+        if _audio_input_available:
+            try:
+                audio_data = st.audio_input(
+                    "Record your answer",
+                    key="voice_recording",
+                )
+            except Exception:
+                audio_data = None
+                st.warning("Voice recording widget failed to load. Try Text mode.")
+        else:
+            audio_data = None
+            st.warning(
+                "Voice recording requires Streamlit >= 1.33.0. "
+                "Switch to Text mode or upgrade Streamlit."
+            )
+
         if audio_data is not None:
             audio_bytes = audio_data.getvalue()
             if audio_bytes and len(audio_bytes) > 0:
-                with st.spinner("Transcribing audio with OpenAI Whisper..."):
-                    try:
-                        raw_transcript = transcribe_audio(audio_bytes)
-                        if raw_transcript:
-                            st.markdown("**Raw transcript:**")
-                            st.info(raw_transcript)
-                            cleaned = summarize_transcript(raw_transcript)
-                            if cleaned != raw_transcript:
-                                st.markdown("**Cleaned transcript:**")
-                                st.success(cleaned)
-                            user_input = cleaned
-                        else:
-                            st.warning("No speech detected in the recording. Try again.")
-                    except Exception as e:
-                        st.error(f"Transcription failed: {e}")
-                        st.info(
-                            "Make sure your OpenAI API key is configured in "
-                            "st.secrets['openai']['api_key'] or OPENAI_API_KEY env var."
-                        )
+                # Store transcription in session state to survive reruns
+                rec_key = f"voice_transcript_{len(st.session_state.chat_messages)}"
+                if rec_key not in st.session_state:
+                    with st.spinner("Transcribing audio with OpenAI Whisper..."):
+                        try:
+                            raw_transcript = transcribe_audio(audio_bytes)
+                            if raw_transcript:
+                                cleaned = summarize_transcript(raw_transcript)
+                                st.session_state[rec_key] = {
+                                    "raw": raw_transcript,
+                                    "cleaned": cleaned,
+                                }
+                            else:
+                                st.session_state[rec_key] = None
+                        except Exception as e:
+                            st.error(f"Transcription failed: {e}")
+                            st.info(
+                                "Make sure your OpenAI API key is configured in "
+                                "st.secrets['openai']['api_key'] or OPENAI_API_KEY env var."
+                            )
+                            st.session_state[rec_key] = None
 
-                if user_input:
+                transcript_data = st.session_state.get(rec_key)
+                if transcript_data:
+                    st.markdown("**Transcript:**")
+                    st.info(transcript_data["raw"])
+                    if transcript_data["cleaned"] != transcript_data["raw"]:
+                        st.markdown("**Cleaned:**")
+                        st.success(transcript_data["cleaned"])
                     if st.button("Submit Voice Answer", type="primary"):
-                        pass  # Will be processed below
-                    else:
-                        user_input = None  # Wait for explicit submit
-    else:
-        user_input = st.chat_input("Type your answer here...")
+                        user_input = transcript_data["cleaned"]
+                        # Clean up transcript state
+                        del st.session_state[rec_key]
+                elif transcript_data is None and rec_key in st.session_state:
+                    st.warning("No speech detected. Try recording again.")
+
+    # Always render chat_input — Streamlit requires it to be present consistently
+    text_input = st.chat_input("Type your answer here...")
+    if input_mode == "Text" and text_input:
+        user_input = text_input
 
     if user_input:
         st.session_state.chat_messages.append({
