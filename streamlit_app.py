@@ -2351,12 +2351,76 @@ if page == "🏠 Home":
 
         4. **Export & Deploy** — Generate Semantic View YAML, Verified Query Repository,
            and Custom Instructions, then deploy directly to Snowflake.
-
-        ---
-
-        Use the sidebar to navigate between pages.
         """
     )
+
+    # -----------------------------------------------------------------
+    # My Context Sessions
+    # -----------------------------------------------------------------
+    st.markdown("---")
+    st.header("My Context Sessions")
+
+    home_sessions = []
+    try:
+        home_sessions = list_sessions()
+    except Exception as e:
+        st.warning(f"Could not load sessions: {e}")
+
+    if not home_sessions:
+        st.info("No sessions yet. Create one from the sidebar to get started.")
+    else:
+        for s in home_sessions:
+            sid = s["SESSION_ID"]
+            name = s.get("SESSION_NAME", "Untitled")
+            status = s.get("STATUS", "UNKNOWN")
+            created = s.get("CREATED_AT", "")
+            updated = s.get("UPDATED_AT", created)
+
+            # Status badge
+            if status == "COMPLETED":
+                badge = "✅"
+            elif status == "IN_PROGRESS":
+                badge = "🔄"
+            else:
+                badge = "📋"
+
+            # Fact count for this session
+            fact_count = None
+            try:
+                facts = get_all_facts(sid)
+                fact_count = len(facts) if facts else 0
+            except Exception:
+                fact_count = None
+
+            # Coverage scores
+            try:
+                scores = get_coverage_scores(sid)
+                covered_topics = sum(1 for v in scores.values() if v >= 0.8)
+                total_topics = len(TOPIC_AREAS)
+            except Exception:
+                covered_topics = 0
+                total_topics = len(TOPIC_AREAS)
+
+            with st.container(border=True):
+                col_info, col_stats, col_action = st.columns([3, 2, 1])
+
+                with col_info:
+                    st.markdown(f"### {badge} {name}")
+                    st.caption(f"Created: {created}")
+                    if updated and updated != created:
+                        st.caption(f"Last updated: {updated}")
+
+                with col_stats:
+                    if fact_count is not None:
+                        st.metric("Facts", fact_count)
+                    st.caption(f"Topics: {covered_topics}/{total_topics} complete")
+                    st.progress(covered_topics / total_topics if total_topics else 0)
+
+                with col_action:
+                    if st.button("Continue →", key=f"home_open_{sid}", type="primary",
+                                 use_container_width=True):
+                        st.session_state.interview_session_id = sid
+                        st.rerun()
 
     if "interview_session_id" in st.session_state:
         st.sidebar.markdown("---")
