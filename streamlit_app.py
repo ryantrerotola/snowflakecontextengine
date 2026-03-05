@@ -177,16 +177,29 @@ def _sql_str(value: str | None) -> str:
 # CONTEXT STORE — Sessions
 # =============================================================================
 
+def _ensure_created_by_column() -> None:
+    """Add CREATED_BY column to INTERVIEW_SESSIONS if it doesn't exist."""
+    try:
+        run_ddl(
+            "ALTER TABLE CONTEXT_ENGINE.INTERVIEW_SESSIONS "
+            "ADD COLUMN IF NOT EXISTS CREATED_BY VARCHAR(255) DEFAULT CURRENT_USER()"
+        )
+    except Exception:
+        pass  # Column may already exist or ALTER not supported
+
+
 def create_session(session_name: str, target_database: str = None,
                    target_schema: str = None) -> str:
     """Create a new interview session. Returns the session ID."""
+    _ensure_created_by_column()
     session_id = str(uuid.uuid4())
     session = get_session()
     session.sql(
         f"""INSERT INTO CONTEXT_ENGINE.INTERVIEW_SESSIONS
-            (SESSION_ID, SESSION_NAME, TARGET_DATABASE, TARGET_SCHEMA)
+            (SESSION_ID, SESSION_NAME, TARGET_DATABASE, TARGET_SCHEMA, CREATED_BY)
             VALUES ('{session_id}', '{_esc(session_name)}',
-                    {_sql_str(target_database)}, {_sql_str(target_schema)})"""
+                    {_sql_str(target_database)}, {_sql_str(target_schema)},
+                    CURRENT_USER())"""
     ).collect()
     return session_id
 
@@ -200,7 +213,19 @@ def get_session_by_id(session_id: str) -> dict | None:
 
 
 def list_sessions() -> list[dict]:
-    """List all interview sessions, most recent first."""
+    """List interview sessions for the current user, most recent first."""
+    _ensure_created_by_column()
+    try:
+        rows = run_query(
+            "SELECT * FROM CONTEXT_ENGINE.INTERVIEW_SESSIONS "
+            "WHERE CREATED_BY = CURRENT_USER() "
+            "ORDER BY CREATED_AT DESC"
+        )
+        if rows is not None:
+            return rows
+    except Exception:
+        pass
+    # Fallback if CREATED_BY column doesn't exist or query fails
     return run_query(
         "SELECT * FROM CONTEXT_ENGINE.INTERVIEW_SESSIONS ORDER BY CREATED_AT DESC"
     )
@@ -2317,8 +2342,11 @@ st.sidebar.markdown("Build context for Snowflake Intelligence agents.")
 st.sidebar.markdown("---")
 _NAV_PAGES = ["🏠 Home", "📄 Upload Documents", "💬 Context Interview", "📝 Review & Edit", "🚀 Export & Deploy"]
 
-# Allow programmatic navigation: set st.session_state._nav_page before rerun
-if "_nav_page" not in st.session_state:
+# Allow programmatic navigation: set st.session_state._nav_request before rerun
+if "_nav_request" in st.session_state:
+    st.session_state._nav_page = st.session_state._nav_request
+    del st.session_state._nav_request
+elif "_nav_page" not in st.session_state:
     st.session_state._nav_page = _NAV_PAGES[0]
 
 page = st.sidebar.radio(
@@ -2452,7 +2480,7 @@ if page == "🏠 Home":
                     if st.button("Continue →", key=f"home_open_{sid}", type="primary",
                                  use_container_width=True):
                         st.session_state.interview_session_id = sid
-                        st.session_state._nav_page = "💬 Context Interview"
+                        st.session_state._nav_request = "💬 Context Interview"
                         st.rerun()
 
     if "interview_session_id" in st.session_state:
@@ -2806,7 +2834,7 @@ elif page == "💬 Context Interview":
                                     "error": str(e),
                                 }
 
-                    transcript_data = st.session_state.get(rec_key, {})
+                    transcript_data = st.session_state.get(rec_key) or {}
                     if transcript_data.get("status") == "ok":
                         st.markdown("**Raw Transcript:**")
                         st.info(transcript_data["raw"])
