@@ -698,22 +698,15 @@ def _get_file_type(filename: str) -> str:
 # =============================================================================
 
 def _get_openai_api_key() -> str:
-    """Retrieve the OpenAI API key, checking Snowflake table first, then secrets/env."""
-    # 1. Try Snowflake table
+    """Retrieve the OpenAI API key from a Snowflake secret, st.secrets, or env."""
+    # 1. Try Snowflake secret via SYSTEM$GET_SECRET
     try:
-        rows = run_query(
-            "SELECT * FROM VSSANALYTICS_DB.DATA_GOVERNANCE.OPENAI_API_KEY LIMIT 1"
-        )
-        if rows:
-            # Try common column names for the key value
-            row = rows[0]
-            for col in ("API_KEY", "KEY", "SECRET", "VALUE", "OPENAI_API_KEY"):
-                if col in row and row[col]:
-                    return row[col]
-            # If only one column, use its value
-            vals = [v for v in row.values() if v and isinstance(v, str) and len(v) > 10]
-            if vals:
-                return vals[0]
+        session = get_session()
+        result = session.sql(
+            "SELECT SYSTEM$GET_SECRET('VSSANALYTICS_DB.DATA_GOVERNANCE.OPENAI_API_KEY', 'secret_string') AS KEY"
+        ).collect()
+        if result and result[0]["KEY"]:
+            return result[0]["KEY"]
     except Exception:
         pass
 
@@ -730,7 +723,7 @@ def _get_openai_api_key() -> str:
 
     raise RuntimeError(
         "OpenAI API key not found. Checked: "
-        "VSSANALYTICS_DB.DATA_GOVERNANCE.OPENAI_API_KEY table, "
+        "VSSANALYTICS_DB.DATA_GOVERNANCE.OPENAI_API_KEY secret, "
         "st.secrets['openai']['api_key'], and OPENAI_API_KEY env var."
     )
 
