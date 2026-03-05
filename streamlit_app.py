@@ -672,28 +672,53 @@ def _get_file_type(filename: str) -> str:
 # VOICE TRANSCRIPTION (OpenAI Whisper)
 # =============================================================================
 
-def transcribe_audio(audio_bytes: bytes) -> str:
-    """Transcribe audio bytes using OpenAI Whisper API.
+def _get_openai_api_key() -> str:
+    """Retrieve the OpenAI API key, checking Snowflake table first, then secrets/env."""
+    # 1. Try Snowflake table
+    try:
+        rows = run_query(
+            "SELECT * FROM VSSANALYTICS_DB.DATA_GOVERNANCE.OPENAI_API_KEY LIMIT 1"
+        )
+        if rows:
+            # Try common column names for the key value
+            row = rows[0]
+            for col in ("API_KEY", "KEY", "SECRET", "VALUE", "OPENAI_API_KEY"):
+                if col in row and row[col]:
+                    return row[col]
+            # If only one column, use its value
+            vals = [v for v in row.values() if v and isinstance(v, str) and len(v) > 10]
+            if vals:
+                return vals[0]
+    except Exception:
+        pass
 
-    Requires OPENAI_API_KEY in st.secrets or environment variables.
-    """
+    # 2. Try st.secrets
+    try:
+        return st.secrets["openai"]["api_key"]
+    except Exception:
+        pass
+
+    # 3. Try environment variable
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+
+    raise RuntimeError(
+        "OpenAI API key not found. Checked: "
+        "VSSANALYTICS_DB.DATA_GOVERNANCE.OPENAI_API_KEY table, "
+        "st.secrets['openai']['api_key'], and OPENAI_API_KEY env var."
+    )
+
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    """Transcribe audio bytes using OpenAI Whisper API."""
     if _OpenAI is None:
         raise RuntimeError(
             "The openai package is not installed. "
             "Add 'openai' to requirements.txt and reinstall."
         )
 
-    api_key = None
-    try:
-        api_key = st.secrets["openai"]["api_key"]
-    except Exception:
-        api_key = os.environ.get("OPENAI_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "OpenAI API key not found. Set it in st.secrets['openai']['api_key'] "
-            "or the OPENAI_API_KEY environment variable."
-        )
+    api_key = _get_openai_api_key()
 
     client = _OpenAI(api_key=api_key)
     audio_file = io.BytesIO(audio_bytes)
@@ -2290,9 +2315,16 @@ st.sidebar.markdown("Build context for Snowflake Intelligence agents.")
 # Page Navigation (render FIRST so it always appears)
 # ---------------------------------------------------------------------------
 st.sidebar.markdown("---")
+_NAV_PAGES = ["🏠 Home", "📄 Upload Documents", "💬 Context Interview", "📝 Review & Edit", "🚀 Export & Deploy"]
+
+# Allow programmatic navigation: set st.session_state._nav_page before rerun
+if "_nav_page" not in st.session_state:
+    st.session_state._nav_page = _NAV_PAGES[0]
+
 page = st.sidebar.radio(
     "Navigate",
-    ["🏠 Home", "📄 Upload Documents", "💬 Context Interview", "📝 Review & Edit", "🚀 Export & Deploy"],
+    _NAV_PAGES,
+    key="_nav_page",
 )
 
 # ---------------------------------------------------------------------------
@@ -2420,6 +2452,7 @@ if page == "🏠 Home":
                     if st.button("Continue →", key=f"home_open_{sid}", type="primary",
                                  use_container_width=True):
                         st.session_state.interview_session_id = sid
+                        st.session_state._nav_page = "💬 Context Interview"
                         st.rerun()
 
     if "interview_session_id" in st.session_state:
@@ -2759,21 +2792,22 @@ elif page == "💬 Context Interview":
                                 if raw_transcript:
                                     cleaned = summarize_transcript(raw_transcript)
                                     st.session_state[rec_key] = {
+                                        "status": "ok",
                                         "raw": raw_transcript,
                                         "cleaned": cleaned,
                                     }
                                 else:
-                                    st.session_state[rec_key] = None
+                                    st.session_state[rec_key] = {
+                                        "status": "empty",
+                                    }
                             except Exception as e:
-                                st.error(f"Transcription failed: {e}")
-                                st.info(
-                                    "Make sure your OpenAI API key is configured in "
-                                    "st.secrets['openai']['api_key'] or OPENAI_API_KEY env var."
-                                )
-                                st.session_state[rec_key] = None
+                                st.session_state[rec_key] = {
+                                    "status": "error",
+                                    "error": str(e),
+                                }
 
-                    transcript_data = st.session_state.get(rec_key)
-                    if transcript_data:
+                    transcript_data = st.session_state.get(rec_key, {})
+                    if transcript_data.get("status") == "ok":
                         st.markdown("**Raw Transcript:**")
                         st.info(transcript_data["raw"])
                         if transcript_data["cleaned"] != transcript_data["raw"]:
@@ -2782,8 +2816,16 @@ elif page == "💬 Context Interview":
                         if st.button("✅ Submit Voice Answer", type="primary"):
                             user_input = transcript_data["cleaned"]
                             del st.session_state[rec_key]
-                    elif transcript_data is None and rec_key in st.session_state:
+                    elif transcript_data.get("status") == "error":
+                        st.error(f"Transcription failed: {transcript_data['error']}")
+                        if st.button("🔄 Retry", key=f"retry_{rec_key}"):
+                            del st.session_state[rec_key]
+                            st.rerun()
+                    elif transcript_data.get("status") == "empty":
                         st.warning("No speech detected. Try recording again.")
+                        if st.button("🔄 Retry", key=f"retry_{rec_key}"):
+                            del st.session_state[rec_key]
+                            st.rerun()
 
     # Text input — always available
     text_input = st.chat_input("Type your answer here... (or use 🎙️ Voice Mode above)")
